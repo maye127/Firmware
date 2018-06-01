@@ -38,19 +38,18 @@
  * @author Julian Oes <julian@oes.ch>
  */
 
-#ifndef NAVIGATOR_MISSION_BLOCK_H
-#define NAVIGATOR_MISSION_BLOCK_H
-
-#include <drivers/drv_hrt.h>
-
-#include <navigator/navigation.h>
-
-#include <uORB/topics/mission.h>
-#include <uORB/topics/vehicle_global_position.h>
-#include <uORB/topics/position_setpoint_triplet.h>
-#include <uORB/topics/actuator_controls.h>
+#pragma once
 
 #include "navigator_mode.h"
+#include "navigation.h"
+
+#include <drivers/drv_hrt.h>
+#include <systemlib/mavlink_log.h>
+#include <uORB/topics/mission.h>
+#include <uORB/topics/position_setpoint_triplet.h>
+#include <uORB/topics/vehicle_command.h>
+#include <uORB/topics/vehicle_global_position.h>
+#include <uORB/topics/vtol_vehicle_status.h>
 
 class Navigator;
 
@@ -60,12 +59,13 @@ public:
 	/**
 	 * Constructor
 	 */
-	MissionBlock(Navigator *navigator, const char *name);
+	MissionBlock(Navigator *navigator);
+	virtual ~MissionBlock() = default;
 
-	/**
-	 * Destructor
-	 */
-	virtual ~MissionBlock();
+	MissionBlock(const MissionBlock &) = delete;
+	MissionBlock &operator=(const MissionBlock &) = delete;
+
+	static bool item_contains_position(const mission_item_s &item);
 
 protected:
 	/**
@@ -73,6 +73,7 @@ protected:
 	 * @return true if successfully reached
 	 */
 	bool is_mission_item_reached();
+
 	/**
 	 * Reset all reached flags
 	 */
@@ -84,26 +85,52 @@ protected:
 	 * @param the mission item to convert
 	 * @param the position setpoint that needs to be set
 	 */
-	void mission_item_to_position_setpoint(const mission_item_s *item, position_setpoint_s *sp);
-
-	/**
-	 * Set previous position setpoint to current setpoint
-	 */
-	void set_previous_pos_setpoint();
+	bool mission_item_to_position_setpoint(const mission_item_s &item, position_setpoint_s *sp);
 
 	/**
 	 * Set a loiter mission item, if possible reuse the position setpoint, otherwise take the current position
 	 */
 	void set_loiter_item(struct mission_item_s *item, float min_clearance = -1.0f);
 
-	mission_item_s _mission_item;
-	bool _waypoint_position_reached;
-	bool _waypoint_yaw_reached;
-	hrt_abstime _time_first_inside_orbit;
+	/**
+	 * Set a takeoff mission item
+	 */
+	void set_takeoff_item(struct mission_item_s *item, float abs_altitude, float min_pitch = 0.0f);
 
-	actuator_controls_s _actuators;
-	orb_advert_t    _actuator_pub;
+	/**
+	 * Set a land mission item
+	 */
+	void set_land_item(struct mission_item_s *item, bool at_current_location);
 
+	/**
+	 * Set idle mission item
+	 */
+	void set_idle_item(struct mission_item_s *item);
+
+	/**
+	 * Set vtol transition item
+	 */
+	void set_vtol_transition_item(struct mission_item_s *item, const uint8_t new_mode);
+
+	/**
+	 * General function used to adjust the mission item based on vehicle specific limitations
+	 */
+	void	mission_apply_limitation(mission_item_s &item);
+
+	void issue_command(const mission_item_s &item);
+
+	float get_time_inside(const struct mission_item_s &item);
+
+	float get_absolute_altitude_for_item(struct mission_item_s &mission_item) const;
+
+	mission_item_s _mission_item{};
+
+	bool _waypoint_position_reached{false};
+	bool _waypoint_yaw_reached{false};
+
+	hrt_abstime _time_first_inside_orbit{0};
+	hrt_abstime _action_start{0};
+	hrt_abstime _time_wp_reached{0};
+
+	orb_advert_t    _actuator_pub{nullptr};
 };
-
-#endif

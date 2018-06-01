@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- *   Copyright (c) 2014 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2014-2017 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -44,7 +44,6 @@
 #include <drivers/drv_hrt.h>
 
 class Mavlink;
-class MavlinkStream;
 
 class MavlinkStream
 {
@@ -58,23 +57,23 @@ public:
 	/**
 	 * Get the interval
 	 *
-	 * @param interval the inveral in microseconds (us) between messages
+	 * @param interval the interval in microseconds (us) between messages
 	 */
-	void set_interval(const unsigned int interval);
+	void set_interval(const int interval);
 
 	/**
 	 * Get the interval
 	 *
 	 * @return the inveral in microseconds (us) between messages
 	 */
-	unsigned get_interval() { return _interval; }
+	int get_interval() { return _interval; }
 
 	/**
 	 * @return 0 if updated / sent, -1 if unchanged
 	 */
 	int update(const hrt_abstime t);
 	virtual const char *get_name() const = 0;
-	virtual uint8_t get_id() = 0;
+	virtual uint16_t get_id() = 0;
 
 	/**
 	 * @return true if steam rate shouldn't be adjusted
@@ -86,13 +85,31 @@ public:
 	 */
 	virtual unsigned get_size() = 0;
 
+	/**
+	 * Get the average message size
+	 *
+	 * For a normal stream this equals the message size,
+	 * for something like a parameter or mission message
+	 * this equals usually zero, as no bandwidth
+	 * needs to be reserved
+	 */
+	virtual unsigned get_size_avg() { return get_size(); }
+
 protected:
 	Mavlink     *_mavlink;
-	unsigned int _interval;
+	int _interval;		///< if set to negative value = unlimited rate
 
 #ifndef __PX4_QURT
-	virtual void send(const hrt_abstime t) = 0;
+	virtual bool send(const hrt_abstime t) = 0;
 #endif
+
+	/**
+	 * Function to collect/update data for the streams at a high rate independant of
+	 * actual stream rate.
+	 *
+	 * This function is called at every iteration of the mavlink module.
+	 */
+	virtual void update_data() { }
 
 private:
 	hrt_abstime _last_sent;

@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- *   Copyright (c) 2014 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2014-2016 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -36,7 +36,7 @@
  *
  * Parameters for mission.
  *
- * @author Julian Oes <joes@student.ethz.ch>
+ * @author Julian Oes <julian@oes.ch>
  */
 
 /*
@@ -46,38 +46,63 @@
 /**
  * Take-off altitude
  *
- * Even if first waypoint has altitude less then MIS_TAKEOFF_ALT above home position, system will climb to
- * MIS_TAKEOFF_ALT on takeoff, then go to waypoint.
+ * This is the minimum altitude the system will take off to.
  *
- * @unit meters
+ * @unit m
+ * @min 0
+ * @max 80
+ * @decimal 1
+ * @increment 0.5
  * @group Mission
  */
-PARAM_DEFINE_FLOAT(MIS_TAKEOFF_ALT, 10.0f);
+PARAM_DEFINE_FLOAT(MIS_TAKEOFF_ALT, 2.5f);
 
 /**
- * Enable persistent onboard mission storage
+ * Minimum Loiter altitude
  *
- * When enabled, missions that have been uploaded by the GCS are stored
- * and reloaded after reboot persistently.
+ * This is the minimum altitude the system will always obey. The intent is to stay out of ground effect.
+ * set to -1, if there shouldn't be a minimum loiter altitude
  *
- * @min 0
- * @max 1
+ * @unit m
+ * @min -1
+ * @max 80
+ * @decimal 1
+ * @increment 0.5
  * @group Mission
  */
-PARAM_DEFINE_INT32(MIS_ONBOARD_EN, 1);
+PARAM_DEFINE_FLOAT(MIS_LTRMIN_ALT, -1.0f);
 
 /**
  * Maximal horizontal distance from home to first waypoint
  *
  * Failsafe check to prevent running mission stored from previous flight at a new takeoff location.
  * Set a value of zero or less to disable. The mission will not be started if the current
- * waypoint is more distant than MIS_DIS_1WP from the current position.
+ * waypoint is more distant than MIS_DIS_1WP from the home position.
  *
+ * @unit m
  * @min 0
- * @max 1000
+ * @max 10000
+ * @decimal 1
+ * @increment 100
  * @group Mission
  */
 PARAM_DEFINE_FLOAT(MIS_DIST_1WP, 900);
+
+/**
+ * Maximal horizontal distance between waypoint
+ *
+ * Failsafe check to prevent running missions which are way too big.
+ * Set a value of zero or less to disable. The mission will not be started if any distance between
+ * two subsequent waypoints is greater than MIS_DIST_WPS.
+ *
+ * @unit m
+ * @min 0
+ * @max 10000
+ * @decimal 1
+ * @increment 100
+ * @group Mission
+ */
+PARAM_DEFINE_FLOAT(MIS_DIST_WPS, 900);
 
 /**
  * Altitude setpoint mode
@@ -88,6 +113,8 @@ PARAM_DEFINE_FLOAT(MIS_DIST_1WP, 900);
  *
  * @min 0
  * @max 1
+ * @value 0 Zero Order Hold
+ * @value 1 First Order Hold
  * @group Mission
  */
 PARAM_DEFINE_INT32(MIS_ALTMODE, 1);
@@ -95,15 +122,57 @@ PARAM_DEFINE_INT32(MIS_ALTMODE, 1);
 /**
  * Multirotor only. Yaw setpoint mode.
  *
- * 0: Set the yaw heading to the yaw value specified for the destination waypoint.
- * 1: Maintain a yaw heading pointing towards the next waypoint.
- * 2: Maintain a yaw heading that always points to the home location.
- * 3: Maintain a yaw heading that always points away from the home location (ie: back always faces home).
- *
  * The values are defined in the enum mission_altitude_mode
  *
  * @min 0
  * @max 3
+ * @value 0 Heading as set by waypoint
+ * @value 1 Heading towards waypoint
+ * @value 2 Heading towards home
+ * @value 3 Heading away from home
  * @group Mission
  */
 PARAM_DEFINE_INT32(MIS_YAWMODE, 1);
+
+/**
+* Enable yaw control of the mount. (Only affects multicopters and ROI mission items)
+*
+* If enabled, yaw commands will be sent to the mount and the vehicle will follow its heading mode as specified by MIS_YAWMODE.
+* If disabled, the vehicle will yaw towards the ROI.
+*
+* @value 0 Disable
+* @value 1 Enable
+* @min 0
+* @max 1
+* @group Mission
+*/
+PARAM_DEFINE_INT32(MIS_MNT_YAW_CTL, 0);
+
+/**
+ * Time in seconds we wait on reaching target heading at a waypoint if it is forced.
+ *
+ * If set > 0 it will ignore the target heading for normal waypoint acceptance. If the
+ * waypoint forces the heading the timeout will matter. For example on VTOL forwards transition.
+ * Mainly useful for VTOLs that have less yaw authority and might not reach target
+ * yaw in wind. Disabled by default.
+ *
+ * @unit s
+ * @min -1
+ * @max 20
+ * @decimal 1
+ * @increment 1
+ * @group Mission
+ */
+PARAM_DEFINE_FLOAT(MIS_YAW_TMT, -1.0f);
+
+/**
+ * Max yaw error in degrees needed for waypoint heading acceptance.
+ *
+ * @unit deg
+ * @min 0
+ * @max 90
+ * @decimal 1
+ * @increment 1
+ * @group Mission
+ */
+PARAM_DEFINE_FLOAT(MIS_YAW_ERR, 12.0f);

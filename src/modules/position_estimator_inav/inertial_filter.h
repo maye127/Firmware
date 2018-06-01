@@ -5,9 +5,11 @@
  *   Author: 	Anton Babushkin	<rk3dov@gmail.com>
  */
 
+#pragma once
+
 #include <stdbool.h>
 #include <drivers/drv_hrt.h>
 
-void inertial_filter_predict(float dt, float x[3], float acc);
+void inertial_filter_predict(float dt, float x[2], float acc);
 
-void inertial_filter_correct(float e, float dt, float x[3], int i, float w);
+void inertial_filter_correct(float e, float dt, float x[2], int i, float w);

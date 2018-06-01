@@ -32,9 +32,10 @@
  ****************************************************************************/
 
 /**
-* @file tiltrotor.h
+* @file tailsitter.h
 *
 * @author Roman Bapst 		<bapstroman@gmail.com>
+* @author David Vorsin     <davidvorsin@gmail.com>
 *
 */
 
@@ -42,7 +43,9 @@
 #define TAILSITTER_H
 
 #include "vtol_type.h"
-#include <systemlib/perf_counter.h>
+#include <perf/perf_counter.h>  /** is it necsacery? **/
+#include <parameters/param.h>
+#include <drivers/drv_hrt.h>
 
 class Tailsitter : public VtolType
 {
@@ -51,21 +54,43 @@ public:
 	Tailsitter(VtolAttitudeControl *_att_controller);
 	~Tailsitter();
 
-	void update_vtol_state();
-	void update_mc_state();
-	void update_fw_state();
-	void update_transition_state();
-	void update_external_state();
+	virtual void update_vtol_state();
+	virtual void update_transition_state();
+	virtual void update_mc_state();
+	virtual void update_fw_state();
+	virtual void fill_actuator_outputs();
+	virtual void waiting_on_tecs();
 
 private:
-	void fill_actuator_outputs();
-	void calc_tot_airspeed();
-	void scale_mc_output();
 
-	float _airspeed_tot;
+	struct {
+		float front_trans_dur_p2;
+	} _params_tailsitter;
 
-	perf_counter_t	_loop_perf;			/**< loop performance counter */
-	perf_counter_t	_nonfinite_input_perf;		/**< performance counter for non finite input */
+	struct {
+		param_t front_trans_dur_p2;
+	} _params_handles_tailsitter;
+
+	enum vtol_mode {
+		MC_MODE = 0,			/**< vtol is in multicopter mode */
+		TRANSITION_FRONT_P1,	/**< vtol is in front transition part 1 mode */
+		TRANSITION_BACK,		/**< vtol is in back transition mode */
+		FW_MODE					/**< vtol is in fixed wing mode */
+	};
+
+	struct {
+		vtol_mode flight_mode;			/**< vtol flight mode, defined by enum vtol_mode */
+		hrt_abstime transition_start;	/**< absoulte time at which front transition started */
+	} _vtol_schedule;
+
+	float _thrust_transition_start; // throttle value when we start the front transition
+	float _yaw_transition;	// yaw angle in which transition will take place
+	float _pitch_transition_start;  // pitch angle at the start of transition (tailsitter)
+
+	/**
+	 * Update parameters.
+	 */
+	virtual void parameters_update();
 
 };
 #endif

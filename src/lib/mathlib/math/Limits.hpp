@@ -40,49 +40,54 @@
 #pragma once
 
 #include <platforms/px4_defines.h>
-#include <stdint.h>
+
+//this should be defined in stdint.h, but seems to be missing in the ARM toolchain (5.2.0)
+#ifndef UINT64_C
+# if __WORDSIZE == 64
+#  define UINT64_C(c)	c ## UL
+# else
+#  define UINT64_C(c)	c ## ULL
+# endif
+#endif
+
 
 namespace math
 {
 
+template<typename _Tp>
+constexpr const _Tp &min(const _Tp &a, const _Tp &b)
+{
+	return (a < b) ? a : b;
+}
 
-float __EXPORT min(float val1, float val2);
+template<typename _Tp>
+constexpr const _Tp &max(const _Tp &a, const _Tp &b)
+{
+	return (a > b) ? a : b;
+}
 
-int __EXPORT min(int val1, int val2);
+template<typename _Tp>
+constexpr const _Tp &constrain(const _Tp &val, const _Tp &min_val, const _Tp &max_val)
+{
+	return (val < min_val) ? min_val : ((val > max_val) ? max_val : val);
+}
 
-unsigned __EXPORT min(unsigned val1, unsigned val2);
+template<typename _Tp>
+inline constexpr bool isInRange(const _Tp &val, const _Tp &min_val, const _Tp &max_val)
+{
+	return (min_val <= val) && (val <= max_val);
+}
 
-uint64_t __EXPORT min(uint64_t val1, uint64_t val2);
+template<typename T>
+constexpr T radians(const T degrees)
+{
+	return degrees * (static_cast<T>(M_PI) / static_cast<T>(180));
+}
 
-double __EXPORT min(double val1, double val2);
-
-float __EXPORT max(float val1, float val2);
-
-int __EXPORT max(int val1, int val2);
-
-unsigned __EXPORT max(unsigned val1, unsigned val2);
-
-uint64_t __EXPORT max(uint64_t val1, uint64_t val2);
-
-double __EXPORT max(double val1, double val2);
-
-
-float __EXPORT constrain(float val, float min, float max);
-
-int __EXPORT constrain(int val, int min, int max);
-
-unsigned __EXPORT constrain(unsigned val, unsigned min, unsigned max);
-
-uint64_t __EXPORT constrain(uint64_t val, uint64_t min, uint64_t max);
-
-double __EXPORT constrain(double val, double min, double max);
-
-float __EXPORT radians(float degrees);
-
-double __EXPORT radians(double degrees);
-
-float __EXPORT degrees(float radians);
-
-double __EXPORT degrees(double radians);
+template<typename T>
+constexpr T degrees(const T radians)
+{
+	return radians * (static_cast<T>(180) / static_cast<T>(M_PI));
+}
 
 }

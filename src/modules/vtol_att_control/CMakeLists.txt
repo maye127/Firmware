@@ -33,19 +33,14 @@
 px4_add_module(
 	MODULE modules__vtol_att_control
 	MAIN vtol_att_control
+	STACK_MAIN 1300
 	COMPILE_FLAGS
-		-Wno-write-strings
-		
 	SRCS
 		vtol_att_control_main.cpp
-		vtol_att_control_params.c
-		tiltrotor_params.c
 		tiltrotor.cpp
 		vtol_type.cpp
 		tailsitter.cpp
-		standard_params.c
 		standard.cpp
 	DEPENDS
-		platforms__common
 	)
-# vim: set noet ft=cmake fenc=utf-8 ff=unix : 
+

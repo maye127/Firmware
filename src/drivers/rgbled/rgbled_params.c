@@ -41,7 +41,7 @@
 
 
 #include <px4_config.h>
-#include <systemlib/param/param.h>
+#include <parameters/param.h>
 
 /**
  * RGB Led brightness limit
@@ -50,5 +50,6 @@
  *
  * @min 0
  * @max 15
+ * @group System
  */
 PARAM_DEFINE_INT32(LED_RGB_MAXBRT, 15);

@@ -42,29 +42,72 @@
 #ifndef STATE_MACHINE_HELPER_H_
 #define STATE_MACHINE_HELPER_H_
 
+#include <drivers/drv_hrt.h>
+
 #include <uORB/uORB.h>
 #include <uORB/topics/vehicle_status.h>
+#include <uORB/topics/battery_status.h>
 #include <uORB/topics/actuator_armed.h>
 #include <uORB/topics/safety.h>
+#include <uORB/topics/commander_state.h>
+#include <uORB/topics/vehicle_status_flags.h>
 
 typedef enum {
 	TRANSITION_DENIED = -1,
 	TRANSITION_NOT_CHANGED = 0,
 	TRANSITION_CHANGED
-
 } transition_result_t;
 
-bool is_safe(const struct vehicle_status_s *current_state, const struct safety_s *safety, const struct actuator_armed_s *armed);
+enum class link_loss_actions_t {
+	DISABLED = 0,
+	AUTO_LOITER = 1,
+	AUTO_RTL = 2,
+	AUTO_LAND = 3,
+	AUTO_RECOVER = 4,
+	TERMINATE = 5,
+	LOCKDOWN = 6,
+};
 
-transition_result_t arming_state_transition(struct vehicle_status_s *current_state, const struct safety_s *safety,
-		arming_state_t new_arming_state, struct actuator_armed_s *armed, bool fRunPreArmChecks, const int mavlink_fd);
+typedef enum {
+	ARM_REQ_NONE = 0,
+	ARM_REQ_MISSION_BIT = (1 << 0),
+	ARM_REQ_ARM_AUTH_BIT = (1 << 1),
+	ARM_REQ_GPS_BIT = (1 << 2),
+} arm_requirements_t;
 
-transition_result_t main_state_transition(struct vehicle_status_s *current_state, main_state_t new_main_state);
+extern const char *const arming_state_names[];
 
-transition_result_t hil_state_transition(hil_state_t new_state, orb_advert_t status_pub, struct vehicle_status_s *current_state, const int mavlink_fd);
+bool is_safe(const safety_s &safety, const actuator_armed_s &armed);
 
-bool set_nav_state(struct vehicle_status_s *status, const bool data_link_loss_enabled, const bool mission_finished, const bool stay_in_failsafe);
+transition_result_t arming_state_transition(vehicle_status_s *status, const battery_status_s &battery,
+		const safety_s &safety, const arming_state_t new_arming_state, actuator_armed_s *armed, const bool fRunPreArmChecks,
+		orb_advert_t *mavlink_log_pub, vehicle_status_flags_s *status_flags,
+		const uint8_t arm_requirements, const hrt_abstime &time_since_boot);
 
-int prearm_check(const struct vehicle_status_s *status, const int mavlink_fd);
+transition_result_t
+main_state_transition(const vehicle_status_s &status, const main_state_t new_main_state,
+		      const vehicle_status_flags_s &status_flags, commander_state_s *internal_state);
+
+transition_result_t hil_state_transition(hil_state_t new_state, orb_advert_t status_pub,
+		vehicle_status_s *current_status, orb_advert_t *mavlink_log_pub);
+
+void enable_failsafe(vehicle_status_s *status, bool old_failsafe, orb_advert_t *mavlink_log_pub, const char *reason);
+
+bool set_nav_state(vehicle_status_s *status, actuator_armed_s *armed, commander_state_s *internal_state,
+		   orb_advert_t *mavlink_log_pub, const link_loss_actions_t data_link_loss_act, const bool mission_finished,
+		   const bool stay_in_failsafe, const vehicle_status_flags_s &status_flags, bool landed,
+		   const link_loss_actions_t rc_loss_act, const int offb_loss_act, const int offb_loss_rc_act,
+		   const int posctl_nav_loss_act);
+
+/*
+ * Checks the validty of position data aaainst the requirements of the current navigation
+ * mode and switches mode if position data required is not available.
+ */
+bool check_invalid_pos_nav_state(vehicle_status_s *status, bool old_failsafe, orb_advert_t *mavlink_log_pub,
+				 const vehicle_status_flags_s &status_flags, const bool use_rc, const bool using_global_pos);
+
+bool prearm_check(orb_advert_t *mavlink_log_pub, const vehicle_status_flags_s &status_flags,
+		  const battery_status_s &battery, const safety_s &safety, const uint8_t arm_requirements,
+		  const hrt_abstime &time_since_boot);
 
 #endif /* STATE_MACHINE_HELPER_H_ */

@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- *   Copyright (c) 2012-2014 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2012-2017 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -35,6 +35,8 @@
  * @file registers.c
  *
  * Implementation of the PX4IO register space.
+ *
+ * @author Lorenz Meier <lorenz@px4.io>
  */
 
 #include <px4_config.h>
@@ -47,6 +49,8 @@
 #include <drivers/drv_pwm_output.h>
 #include <systemlib/systemlib.h>
 #include <stm32_pwr.h>
+#include <rc/dsm.h>
+#include <rc/sbus.h>
 
 #include "px4io.h"
 #include "protocol.h"
@@ -54,6 +58,7 @@
 static int	registers_set_one(uint8_t page, uint8_t offset, uint16_t value);
 static void	pwm_configure_rates(uint16_t map, uint16_t defaultrate, uint16_t altrate);
 
+bool update_mc_thrust_param;
 /**
  * PAGE 0
  *
@@ -61,13 +66,9 @@ static void	pwm_configure_rates(uint16_t map, uint16_t defaultrate, uint16_t alt
  */
 static const uint16_t	r_page_config[] = {
 	[PX4IO_P_CONFIG_PROTOCOL_VERSION]	= PX4IO_PROTOCOL_VERSION,
-#ifdef CONFIG_ARCH_BOARD_PX4IO_V2
 	[PX4IO_P_CONFIG_HARDWARE_VERSION]	= 2,
-#else
-	[PX4IO_P_CONFIG_HARDWARE_VERSION]	= 1,
-#endif
-	[PX4IO_P_CONFIG_BOOTLOADER_VERSION]	= 3,	/* XXX hardcoded magic number */
-	[PX4IO_P_CONFIG_MAX_TRANSFER]		= 64,	/* XXX hardcoded magic number */
+	[PX4IO_P_CONFIG_BOOTLOADER_VERSION]	= PX4IO_BL_VERSION,
+	[PX4IO_P_CONFIG_MAX_TRANSFER]		= PX4IO_MAX_TRANSFER_LEN,
 	[PX4IO_P_CONFIG_CONTROL_COUNT]		= PX4IO_CONTROL_CHANNELS,
 	[PX4IO_P_CONFIG_ACTUATOR_COUNT]		= PX4IO_SERVO_COUNT,
 	[PX4IO_P_CONFIG_RC_INPUT_COUNT]		= PX4IO_RC_INPUT_CHANNELS,
@@ -80,13 +81,11 @@ static const uint16_t	r_page_config[] = {
  *
  * Status values.
  */
-uint16_t		r_page_status[] = {
+volatile uint16_t	r_page_status[] = {
 	[PX4IO_P_STATUS_FREEMEM]		= 0,
 	[PX4IO_P_STATUS_CPULOAD]		= 0,
 	[PX4IO_P_STATUS_FLAGS]			= 0,
 	[PX4IO_P_STATUS_ALARMS]			= 0,
-	[PX4IO_P_STATUS_VBATT]			= 0,
-	[PX4IO_P_STATUS_IBATT]			= 0,
 	[PX4IO_P_STATUS_VSERVO]			= 0,
 	[PX4IO_P_STATUS_VRSSI]			= 0,
 	[PX4IO_P_STATUS_PRSSI]			= 0,
@@ -141,27 +140,27 @@ uint16_t		r_page_rc_input[] = {
 uint16_t		r_page_scratch[32];
 
 /**
+ * PAGE 8
+ *
+ * RAW PWM values
+ */
+uint16_t		r_page_direct_pwm[PX4IO_SERVO_COUNT];
+
+/**
  * PAGE 100
  *
  * Setup registers
  */
 volatile uint16_t	r_page_setup[] = {
-#ifdef CONFIG_ARCH_BOARD_PX4IO_V2
 	/* default to RSSI ADC functionality */
 	[PX4IO_P_SETUP_FEATURES]		= PX4IO_P_SETUP_FEATURES_ADC_RSSI,
-#else
-	[PX4IO_P_SETUP_FEATURES]		= 0,
-#endif
-	[PX4IO_P_SETUP_ARMING]			= 0,
+	[PX4IO_P_SETUP_ARMING]			= (PX4IO_P_SETUP_ARMING_OVERRIDE_IMMEDIATE),
 	[PX4IO_P_SETUP_PWM_RATES]		= 0,
 	[PX4IO_P_SETUP_PWM_DEFAULTRATE]		= 50,
 	[PX4IO_P_SETUP_PWM_ALTRATE]		= 200,
-#ifdef CONFIG_ARCH_BOARD_PX4IO_V1
-	[PX4IO_P_SETUP_RELAYS]			= 0,
-#else
+	[PX4IO_P_SETUP_SBUS_RATE]		= 72,
 	/* this is unused, but we will pad it for readability (the compiler pads it automatically) */
 	[PX4IO_P_SETUP_RELAYS_PAD]		= 0,
-#endif
 #ifdef ADC_VSERVO
 	[PX4IO_P_SETUP_VSERVO_SCALE]		= 10000,
 #else
@@ -174,17 +173,21 @@ volatile uint16_t	r_page_setup[] = {
 	[PX4IO_P_SETUP_PWM_REVERSE] = 0,
 	[PX4IO_P_SETUP_TRIM_ROLL] = 0,
 	[PX4IO_P_SETUP_TRIM_PITCH] = 0,
-	[PX4IO_P_SETUP_TRIM_YAW] = 0
+	[PX4IO_P_SETUP_TRIM_YAW] = 0,
+	[PX4IO_P_SETUP_SCALE_ROLL] = 10000,
+	[PX4IO_P_SETUP_SCALE_PITCH] = 10000,
+	[PX4IO_P_SETUP_SCALE_YAW] = 10000,
+	[PX4IO_P_SETUP_MOTOR_SLEW_MAX] = 0,
+	[PX4IO_P_SETUP_AIRMODE] = 0,
+	[PX4IO_P_SETUP_THR_MDL_FAC] = 0,
+	[PX4IO_P_SETUP_THERMAL] = PX4IO_THERMAL_IGNORE
 };
 
-#ifdef CONFIG_ARCH_BOARD_PX4IO_V2
 #define PX4IO_P_SETUP_FEATURES_VALID	(PX4IO_P_SETUP_FEATURES_SBUS1_OUT | \
 		PX4IO_P_SETUP_FEATURES_SBUS2_OUT | \
 		PX4IO_P_SETUP_FEATURES_ADC_RSSI | \
 		PX4IO_P_SETUP_FEATURES_PWM_RSSI)
-#else
-#define PX4IO_P_SETUP_FEATURES_VALID	0
-#endif
+
 #define PX4IO_P_SETUP_ARMING_VALID	(PX4IO_P_SETUP_ARMING_FMU_ARMED | \
 		PX4IO_P_SETUP_ARMING_MANUAL_OVERRIDE_OK | \
 		PX4IO_P_SETUP_ARMING_INAIR_RESTART_OK | \
@@ -204,7 +207,7 @@ volatile uint16_t	r_page_setup[] = {
  *
  * Control values from the FMU.
  */
-volatile uint16_t	r_page_controls[PX4IO_CONTROL_GROUPS * PX4IO_CONTROL_CHANNELS];
+uint16_t	r_page_controls[PX4IO_CONTROL_GROUPS * PX4IO_CONTROL_CHANNELS];
 
 /*
  * PAGE 102 does not have a buffer.
@@ -252,6 +255,14 @@ uint16_t		r_page_servo_control_max[PX4IO_SERVO_COUNT] = { PWM_DEFAULT_MAX, PWM_D
 /**
  * PAGE 108
  *
+ * trim values for center position
+ *
+ */
+int16_t		r_page_servo_control_trim[PX4IO_SERVO_COUNT] = { PWM_DEFAULT_TRIM, PWM_DEFAULT_TRIM, PWM_DEFAULT_TRIM, PWM_DEFAULT_TRIM, PWM_DEFAULT_TRIM, PWM_DEFAULT_TRIM, PWM_DEFAULT_TRIM, PWM_DEFAULT_TRIM };
+
+/**
+ * PAGE 109
+ *
  * disarmed PWM values for difficult ESCs
  *
  */
@@ -278,8 +289,6 @@ registers_set(uint8_t page, uint8_t offset, const uint16_t *values, unsigned num
 		}
 
 		system_state.fmu_data_received_time = hrt_absolute_time();
-		r_status_flags |= PX4IO_P_STATUS_FLAGS_FMU_OK;
-		r_status_flags &= ~PX4IO_P_STATUS_FLAGS_RAW_PWM;
 
 		break;
 
@@ -291,7 +300,7 @@ registers_set(uint8_t page, uint8_t offset, const uint16_t *values, unsigned num
 
 			/* XXX range-check value? */
 			if (*values != PWM_IGNORE_THIS_CHANNEL) {
-				r_page_servos[offset] = *values;
+				r_page_direct_pwm[offset] = *values;
 			}
 
 			offset++;
@@ -300,7 +309,12 @@ registers_set(uint8_t page, uint8_t offset, const uint16_t *values, unsigned num
 		}
 
 		system_state.fmu_data_received_time = hrt_absolute_time();
-		r_status_flags |= PX4IO_P_STATUS_FLAGS_FMU_OK | PX4IO_P_STATUS_FLAGS_RAW_PWM;
+		r_status_flags |= PX4IO_P_STATUS_FLAGS_RAW_PWM;
+
+		/* Trigger all timer's channels in Oneshot mode to fire
+		 * the oneshots with updated values.
+		 */
+		up_pwm_update();
 
 		break;
 
@@ -372,6 +386,20 @@ registers_set(uint8_t page, uint8_t offset, const uint16_t *values, unsigned num
 			} else {
 				r_page_servo_control_max[offset] = *values;
 			}
+
+			offset++;
+			num_values--;
+			values++;
+		}
+
+		break;
+
+	case PX4IO_PAGE_CONTROL_TRIM_PWM:
+
+		/* copy channel data */
+		while ((offset < PX4IO_SERVO_COUNT) && (num_values > 0)) {
+
+			r_page_servo_control_trim[offset] = *values;
 
 			offset++;
 			num_values--;
@@ -591,31 +619,21 @@ registers_set_one(uint8_t page, uint8_t offset, uint16_t value)
 			break;
 
 		case PX4IO_P_SETUP_PWM_ALTRATE:
-			if (value < 25) {
-				value = 25;
-			}
 
-			if (value > 400) {
-				value = 400;
+			/* For PWM constrain to [25,400]Hz
+			 * For Oneshot there is no rate, 0 is therefore used to select Oneshot mode
+			 */
+			if (value != 0) {
+				if (value < 25) {
+					value = 25;
+				}
+
+				if (value > 400) {
+					value = 400;
+				}
 			}
 
 			pwm_configure_rates(r_setup_pwm_rates, r_setup_pwm_defaultrate, value);
-			break;
-
-#ifdef CONFIG_ARCH_BOARD_PX4IO_V1
-
-		case PX4IO_P_SETUP_RELAYS:
-			value &= PX4IO_P_SETUP_RELAYS_VALID;
-			r_setup_relays = value;
-			POWER_RELAY1((value & PX4IO_P_SETUP_RELAYS_POWER1) ? 1 : 0);
-			POWER_RELAY2((value & PX4IO_P_SETUP_RELAYS_POWER2) ? 1 : 0);
-			POWER_ACC1((value & PX4IO_P_SETUP_RELAYS_ACC1) ? 1 : 0);
-			POWER_ACC2((value & PX4IO_P_SETUP_RELAYS_ACC2) ? 1 : 0);
-			break;
-#endif
-
-		case PX4IO_P_SETUP_VBATT_SCALE:
-			r_page_setup[PX4IO_P_SETUP_VBATT_SCALE] = value;
 			break;
 
 		case PX4IO_P_SETUP_SET_DEBUG:
@@ -647,6 +665,9 @@ registers_set_one(uint8_t page, uint8_t offset, uint16_t value)
 		case PX4IO_P_SETUP_FORCE_SAFETY_ON:
 			if (value == PX4IO_FORCE_SAFETY_MAGIC) {
 				r_status_flags &= ~PX4IO_P_STATUS_FLAGS_SAFETY_OFF;
+
+			} else {
+				return -1;
 			}
 
 			break;
@@ -654,6 +675,9 @@ registers_set_one(uint8_t page, uint8_t offset, uint16_t value)
 		case PX4IO_P_SETUP_FORCE_SAFETY_OFF:
 			if (value == PX4IO_FORCE_SAFETY_MAGIC) {
 				r_status_flags |= PX4IO_P_STATUS_FLAGS_SAFETY_OFF;
+
+			} else {
+				return -1;
 			}
 
 			break;
@@ -672,7 +696,26 @@ registers_set_one(uint8_t page, uint8_t offset, uint16_t value)
 		case PX4IO_P_SETUP_TRIM_ROLL:
 		case PX4IO_P_SETUP_TRIM_PITCH:
 		case PX4IO_P_SETUP_TRIM_YAW:
+		case PX4IO_P_SETUP_SCALE_ROLL:
+		case PX4IO_P_SETUP_SCALE_PITCH:
+		case PX4IO_P_SETUP_SCALE_YAW:
+		case PX4IO_P_SETUP_MOTOR_SLEW_MAX:
+		case PX4IO_P_SETUP_SBUS_RATE:
 			r_page_setup[offset] = value;
+			sbus1_set_output_rate_hz(value);
+			break;
+
+		case PX4IO_P_SETUP_AIRMODE:
+			r_page_setup[PX4IO_P_SETUP_AIRMODE] = value;
+			break;
+
+		case PX4IO_P_SETUP_THR_MDL_FAC:
+			update_mc_thrust_param = true;
+			r_page_setup[offset] = value;
+			break;
+
+		case PX4IO_P_SETUP_THERMAL:
+			r_page_setup[PX4IO_P_SETUP_THERMAL] = value;
 			break;
 
 		default:
@@ -811,10 +854,6 @@ registers_get(uint8_t page, uint8_t offset, uint16_t **values, unsigned *num_val
 	 */
 	case PX4IO_PAGE_STATUS:
 		/* PX4IO_P_STATUS_FREEMEM */
-		{
-			struct mallinfo minfo = mallinfo();
-			r_page_status[PX4IO_P_STATUS_FREEMEM] = minfo.fordblks;
-		}
 
 		/* XXX PX4IO_P_STATUS_CPULOAD */
 
@@ -846,6 +885,7 @@ registers_get(uint8_t page, uint8_t offset, uint16_t **values, unsigned *num_val
 				r_page_status[PX4IO_P_STATUS_VBATT] = corrected;
 			}
 		}
+
 #endif
 #ifdef ADC_IBATT
 		/* PX4IO_P_STATUS_IBATT */
@@ -960,7 +1000,7 @@ registers_get(uint8_t page, uint8_t offset, uint16_t **values, unsigned *num_val
 		break;
 
 	case PX4IO_PAGE_DIRECT_PWM:
-		SELECT_PAGE(r_page_servos);
+		SELECT_PAGE(r_page_direct_pwm);
 		break;
 
 	case PX4IO_PAGE_FAILSAFE_PWM:
@@ -973,6 +1013,10 @@ registers_get(uint8_t page, uint8_t offset, uint16_t **values, unsigned *num_val
 
 	case PX4IO_PAGE_CONTROL_MAX_PWM:
 		SELECT_PAGE(r_page_servo_control_max);
+		break;
+
+	case PX4IO_PAGE_CONTROL_TRIM_PWM:
+		SELECT_PAGE(r_page_servo_control_trim);
 		break;
 
 	case PX4IO_PAGE_DISARMED_PWM:
