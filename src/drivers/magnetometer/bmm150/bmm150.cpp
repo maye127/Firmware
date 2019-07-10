@@ -37,6 +37,7 @@
  */
 
 #include "bmm150.hpp"
+#include <px4_getopt.h>
 
 /** driver 'main' command */
 extern "C" { __EXPORT int bmm150_main(int argc, char *argv[]); }
@@ -85,8 +86,12 @@ void start(bool external_bus, enum Rotation rotation)
 #endif
 
 	} else {
+#if defined(PX4_I2C_BUS_ONBOARD)
+		*g_dev_ptr = new BMM150(PX4_I2C_BUS_ONBOARD, path, rotation);
+#else
 		PX4_ERR("Internal I2C not available");
 		exit(0);
+#endif
 	}
 
 	if (*g_dev_ptr == nullptr) {
@@ -138,13 +143,12 @@ void test(bool external_bus)
 	fd = open(path, O_RDONLY);
 
 	if (fd < 0) {
-		PX4_ERR("%s open failed (try 'bmm150 start' if the driver is not running)",
-			path);
+		PX4_ERR("%s open failed (try 'bmm150 start' if the driver is not running)", path);
 		exit(1);
 	}
 
-	/* reset to Max polling rate*/
-	if (ioctl(fd, SENSORIOCSPOLLRATE, SENSOR_POLLRATE_MAX) < 0) {
+	/* reset to default polling rate*/
+	if (ioctl(fd, SENSORIOCSPOLLRATE, SENSOR_POLLRATE_DEFAULT) < 0) {
 		PX4_ERR("reset to Max polling rate");
 		exit(1);
 	}
@@ -245,8 +249,9 @@ usage()
 } // namespace bmm150
 
 
-BMM150 :: BMM150(int bus, const char *path, enum Rotation rotation) :
+BMM150::BMM150(int bus, const char *path, enum Rotation rotation) :
 	I2C("BMM150", path, bus, BMM150_SLAVE_ADDRESS, BMM150_BUS_SPEED),
+	ScheduledWorkItem(px4::device_bus_to_wq(get_device_id())),
 	_running(false),
 	_call_interval(0),
 	_reports(nullptr),
@@ -280,9 +285,6 @@ BMM150 :: BMM150(int bus, const char *path, enum Rotation rotation) :
 	_got_duplicate(false)
 {
 	_device_id.devid_s.devtype = DRV_MAG_DEVTYPE_BMM150;
-
-	// work_cancel in the dtor will explode if we don't do this...
-	memset(&_work, 0, sizeof(_work));
 
 	// default scaling
 	_scale.x_offset = 0;
@@ -411,16 +413,14 @@ BMM150::start()
 	_reports->flush();
 
 	/* schedule a cycle to start things */
-	work_queue(HPWORK, &_work, (worker_t)&BMM150::cycle_trampoline, this, 1);
-
+	ScheduleNow();
 }
 
 void
 BMM150::stop()
 {
 	_running = false;
-	work_cancel(HPWORK, &_work);
-
+	ScheduleClear();
 }
 
 ssize_t
@@ -484,26 +484,17 @@ BMM150::read(struct file *filp, char *buffer, size_t buflen)
 
 }
 
-
 void
-BMM150::cycle_trampoline(void *arg)
-{
-	BMM150 *dev = reinterpret_cast<BMM150 *>(arg);
-
-	/* make measurement */
-	dev->cycle();
-}
-
-void
-BMM150::cycle()
+BMM150::Run()
 {
 	if (_collect_phase) {
 		collect();
-		unsigned wait_gap = _call_interval - USEC2TICK(BMM150_CONVERSION_INTERVAL);
+		unsigned wait_gap = _call_interval - BMM150_CONVERSION_INTERVAL;
 
 		if ((wait_gap != 0) && (_running)) {
-			work_queue(HPWORK, &_work, (worker_t)&BMM150::cycle_trampoline, this,
-				   wait_gap); //need to wait some time before new measurement
+			// need to wait some time before new measurement
+			ScheduleDelayed(wait_gap);
+
 			return;
 		}
 
@@ -513,11 +504,7 @@ BMM150::cycle()
 
 	if ((_running)) {
 		/* schedule a fresh cycle call when the measurement is done */
-		work_queue(HPWORK,
-			   &_work,
-			   (worker_t)&BMM150::cycle_trampoline,
-			   this,
-			   USEC2TICK(BMM150_CONVERSION_INTERVAL));
+		ScheduleDelayed(BMM150_CONVERSION_INTERVAL);
 	}
 
 
@@ -725,21 +712,11 @@ BMM150::ioctl(struct file *filp, int cmd, unsigned long arg)
 	case SENSORIOCSPOLLRATE: {
 			switch (arg) {
 
-			/* switching to manual polling */
-			case SENSOR_POLLRATE_MANUAL:
-				stop();
-				_call_interval = 0;
-				return OK;
-
-			/* external signalling (DRDY) not supported */
-			case SENSOR_POLLRATE_EXTERNAL:
-
 			/* zero would be bad */
 			case 0:
 				return -EINVAL;
 
-			/* set default/max polling rate */
-			case SENSOR_POLLRATE_MAX:
+			/* set default polling rate */
 			case SENSOR_POLLRATE_DEFAULT:
 				return ioctl(filp, SENSORIOCSPOLLRATE, BMM150_MAX_DATA_RATE);
 
@@ -749,15 +726,15 @@ BMM150::ioctl(struct file *filp, int cmd, unsigned long arg)
 					bool want_start = (_call_interval == 0);
 
 					/* convert hz to tick interval via microseconds */
-					unsigned ticks = USEC2TICK(1000000 / arg);
+					unsigned interval = (1000000 / arg);
 
 					/* check against maximum rate */
-					if (ticks < USEC2TICK(BMM150_CONVERSION_INTERVAL)) {
+					if (interval < BMM150_CONVERSION_INTERVAL) {
 						return -EINVAL;
 					}
 
 					/* update interval for next measurement */
-					_call_interval = ticks;
+					_call_interval = interval;
 
 					/* if we need to start the poll state machine, do it */
 					if (want_start) {
@@ -767,31 +744,6 @@ BMM150::ioctl(struct file *filp, int cmd, unsigned long arg)
 					return OK;
 				}
 			}
-		}
-
-	case SENSORIOCGPOLLRATE:
-		if (_call_interval == 0) {
-			return SENSOR_POLLRATE_MANUAL;
-		}
-
-		return 1000000 / _call_interval;
-
-	case SENSORIOCSQUEUEDEPTH: {
-			/* lower bound is mandatory, upper bound is a sanity check */
-			if ((arg < 1) || (arg > 100)) {
-				return -EINVAL;
-			}
-
-			irqstate_t flags = px4_enter_critical_section();
-
-			if (!_reports->resize(arg)) {
-				px4_leave_critical_section(flags);
-				return -ENOMEM;
-			}
-
-			px4_leave_critical_section(flags);
-
-			return OK;
 		}
 
 	case SENSORIOCRESET:
@@ -807,21 +759,6 @@ BMM150::ioctl(struct file *filp, int cmd, unsigned long arg)
 		return OK;
 
 	case MAGIOCEXSTRAP:
-		return OK;
-
-	case MAGIOCSELFTEST:
-		return OK;
-
-	case MAGIOCSSAMPLERATE:
-		return ioctl(filp, SENSORIOCSPOLLRATE, arg);
-
-	case MAGIOCGSAMPLERATE:
-		return 1000000 / _call_interval;
-
-	case MAGIOCSRANGE:
-		return OK;
-
-	case MAGIOCGRANGE:
 		return OK;
 
 	default:
@@ -1128,28 +1065,34 @@ BMM150::print_registers()
 int
 bmm150_main(int argc, char *argv[])
 {
-	bool external_bus = false;
+	int myoptind = 1;
 	int ch;
+	const char *myoptarg = nullptr;
+	bool external_bus = false;
 	enum Rotation rotation = ROTATION_NONE;
 
-	/* jump over start/off/etc and look at options first */
-	while ((ch = getopt(argc, argv, "XR:")) != EOF) {
+	while ((ch = px4_getopt(argc, argv, "XR:", &myoptind, &myoptarg)) != EOF) {
 		switch (ch) {
 		case 'X':
 			external_bus = true;
 			break;
 
 		case 'R':
-			rotation = (enum Rotation)atoi(optarg);
+			rotation = (enum Rotation)atoi(myoptarg);
 			break;
 
 		default:
 			bmm150::usage();
-			exit(0);
+			return 0;
 		}
 	}
 
-	const char *verb = argv[optind];
+	if (myoptind >= argc) {
+		bmm150::usage();
+		return -1;
+	}
+
+	const char *verb = argv[myoptind];
 
 	/*
 	 * Start/load the driver.
@@ -1189,5 +1132,5 @@ bmm150_main(int argc, char *argv[])
 
 
 	bmm150::usage();
-	exit(1);
+	return -1;
 }

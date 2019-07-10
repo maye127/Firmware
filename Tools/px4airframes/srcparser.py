@@ -64,6 +64,8 @@ class ParameterGroup(object):
             return "AirframeSimulation"
         elif (self.name == "Plane A-Tail"):
             return "PlaneATail"
+        elif (self.name == "Plane V-Tail"):
+            return "PlaneVTail"
         elif (self.name == "VTOL Duo Tailsitter"):
             return "VTOLDuoRotorTailSitter"
         elif (self.name == "Standard VTOL"):
@@ -72,6 +74,8 @@ class ParameterGroup(object):
             return "VTOLQuadRotorTailSitter"
         elif (self.name == "VTOL Tiltrotor"):
             return "VTOLTiltRotor"
+        elif (self.name == "VTOL Octoplane"):
+            return "VTOLPlaneOcto"
         elif (self.name == "Coaxial Helicopter"):
             return "HelicopterCoaxial"
         elif (self.name == "Helicopter"):

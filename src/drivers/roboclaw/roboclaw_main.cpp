@@ -44,13 +44,13 @@
  */
 
 #include <px4_config.h>
+#include <px4_log.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
-#include <systemlib/systemlib.h>
 #include <parameters/param.h>
 
 #include <arch/board/board.h>
@@ -77,8 +77,7 @@ static void usage();
 
 static void usage()
 {
-	fprintf(stderr, "usage: roboclaw "
-		"{start|stop|status|test}\n\n");
+	PX4_INFO("usage: roboclaw {start|stop|status|test}");
 }
 
 /**

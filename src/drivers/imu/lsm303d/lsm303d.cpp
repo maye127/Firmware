@@ -36,42 +36,19 @@
  * Driver for the ST LSM303D MEMS accelerometer / magnetometer connected via SPI.
  */
 
-#include <px4_config.h>
-#include <px4_defines.h>
-#include <ecl/geo/geo.h>
-
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdlib.h>
-#include <semaphore.h>
-#include <string.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <errno.h>
-#include <stdio.h>
-#include <math.h>
-#include <unistd.h>
-#include <getopt.h>
-
-#include <perf/perf_counter.h>
-#include <systemlib/err.h>
-
-#include <nuttx/arch.h>
-#include <nuttx/clock.h>
-
-#include <drivers/drv_hrt.h>
+#include <drivers/device/integrator.h>
+#include <drivers/device/ringbuffer.h>
 #include <drivers/device/spi.h>
 #include <drivers/drv_accel.h>
 #include <drivers/drv_mag.h>
-#include <drivers/device/ringbuffer.h>
-#include <drivers/device/integrator.h>
-
-#include <board_config.h>
-#include <mathlib/math/filter/LowPassFilter2p.hpp>
+#include <ecl/geo/geo.h>
 #include <lib/conversion/rotation.h>
+#include <mathlib/math/filter/LowPassFilter2p.hpp>
+#include <perf/perf_counter.h>
+#include <px4_getopt.h>
+#include <px4_work_queue/ScheduledWorkItem.hpp>
+#include <systemlib/err.h>
+
 
 /* SPI protocol address bits */
 #define DIR_READ				(1<<7)
@@ -220,7 +197,7 @@ extern "C" { __EXPORT int lsm303d_main(int argc, char *argv[]); }
 
 class LSM303D_mag;
 
-class LSM303D : public device::SPI
+class LSM303D : public device::SPI, public px4::ScheduledWorkItem
 {
 public:
 	LSM303D(int bus, const char *path, uint32_t device, enum Rotation rotation);
@@ -256,10 +233,9 @@ protected:
 
 private:
 
-	LSM303D_mag		*_mag;
+	void Run() override;
 
-	struct hrt_call		_accel_call;
-	struct hrt_call		_mag_call;
+	LSM303D_mag		*_mag;
 
 	unsigned		_call_accel_interval;
 	unsigned		_call_mag_interval;
@@ -308,6 +284,8 @@ private:
 	// last temperature value
 	float			_last_temperature;
 
+	hrt_abstime		_mag_last_measure{0};
+
 	// this is used to support runtime checking of key
 	// configuration registers to detect SPI bus errors and sensor
 	// reset
@@ -339,24 +317,6 @@ private:
 	void			disable_i2c();
 
 	/**
-	 * Static trampoline from the hrt_call context; because we don't have a
-	 * generic hrt wrapper yet.
-	 *
-	 * Called by the HRT in interrupt context at the specified rate if
-	 * automatic polling is enabled.
-	 *
-	 * @param arg		Instance pointer for the driver that is polling.
-	 */
-	static void		measure_trampoline(void *arg);
-
-	/**
-	 * Static trampoline for the mag because it runs at a lower rate
-	 *
-	 * @param arg		Instance pointer for the driver that is polling.
-	 */
-	static void		mag_measure_trampoline(void *arg);
-
-	/**
 	 * check key registers for correct values
 	 */
 	void			check_registers(void);
@@ -370,20 +330,6 @@ private:
 	 * Fetch mag measurements from the sensor and update the report ring.
 	 */
 	void			mag_measure();
-
-	/**
-	 * Accel self test
-	 *
-	 * @return 0 on success, 1 on failure
-	 */
-	int			accel_self_test();
-
-	/**
-	 * Mag self test
-	 *
-	 * @return 0 on success, 1 on failure
-	 */
-	int			mag_self_test();
 
 	/**
 	 * Read a register from the LSM303D
@@ -522,8 +468,6 @@ private:
 
 	void				measure();
 
-	void				measure_trampoline(void *arg);
-
 	/* this class does not allow copying due to ptr data members */
 	LSM303D_mag(const LSM303D_mag &);
 	LSM303D_mag operator=(const LSM303D_mag &);
@@ -533,9 +477,8 @@ private:
 LSM303D::LSM303D(int bus, const char *path, uint32_t device, enum Rotation rotation) :
 	SPI("LSM303D", path, bus, device, SPIDEV_MODE3,
 	    11 * 1000 * 1000 /* will be rounded to 10.4 MHz, within safety margins for LSM303D */),
+	ScheduledWorkItem(px4::device_bus_to_wq(get_device_id())),
 	_mag(new LSM303D_mag(this)),
-	_accel_call{},
-	_mag_call{},
 	_call_accel_interval(0),
 	_call_mag_interval(0),
 	_accel_reports(nullptr),
@@ -622,16 +565,16 @@ LSM303D::~LSM303D()
 int
 LSM303D::init()
 {
-	int ret = PX4_ERROR;
-
 	/* do SPI init (and probe) first */
-	if (SPI::init() != OK) {
-		warnx("SPI init failed");
+	int ret = SPI::init();
+
+	if (ret != OK) {
+		PX4_ERR("SPI init failed (%i)", ret);
 		goto out;
 	}
 
 	/* allocate basic report buffers */
-	_accel_reports = new ringbuffer::RingBuffer(2, sizeof(accel_report));
+	_accel_reports = new ringbuffer::RingBuffer(2, sizeof(sensor_accel_s));
 
 	if (_accel_reports == nullptr) {
 		goto out;
@@ -649,7 +592,7 @@ LSM303D::init()
 	ret = _mag->init();
 
 	if (ret != OK) {
-		warnx("MAG init failed");
+		PX4_ERR("MAG init failed (%i)", ret);
 		goto out;
 	}
 
@@ -664,24 +607,16 @@ LSM303D::init()
 	_mag->_mag_topic = orb_advertise_multi(ORB_ID(sensor_mag), &mrp,
 					       &_mag->_mag_orb_class_instance, ORB_PRIO_LOW);
 
-	if (_mag->_mag_topic == nullptr) {
-		warnx("ADVERT ERR");
-	}
-
 
 	_accel_class_instance = register_class_devname(ACCEL_BASE_DEVICE_PATH);
 
 	/* advertise sensor topic, measure manually to initialize valid report */
-	struct accel_report arp;
+	sensor_accel_s arp;
 	_accel_reports->get(&arp);
 
 	/* measurement will have generated a report, publish */
 	_accel_topic = orb_advertise_multi(ORB_ID(sensor_accel), &arp,
 					   &_accel_orb_class_instance, (external()) ? ORB_PRIO_VERY_HIGH : ORB_PRIO_DEFAULT);
-
-	if (_accel_topic == nullptr) {
-		warnx("ADVERT ERR");
-	}
 
 out:
 	return ret;
@@ -753,8 +688,8 @@ LSM303D::probe()
 ssize_t
 LSM303D::read(struct file *filp, char *buffer, size_t buflen)
 {
-	unsigned count = buflen / sizeof(struct accel_report);
-	accel_report *arb = reinterpret_cast<accel_report *>(buffer);
+	unsigned count = buflen / sizeof(sensor_accel_s);
+	sensor_accel_s *arb = reinterpret_cast<sensor_accel_s *>(buffer);
 	int ret = 0;
 
 	/* buffer must be large enough */
@@ -838,23 +773,11 @@ LSM303D::ioctl(struct file *filp, int cmd, unsigned long arg)
 	case SENSORIOCSPOLLRATE: {
 			switch (arg) {
 
-			/* switching to manual polling */
-			case SENSOR_POLLRATE_MANUAL:
-				stop();
-				_call_accel_interval = 0;
-				return OK;
-
-			/* external signalling not supported */
-			case SENSOR_POLLRATE_EXTERNAL:
-
 			/* zero would be bad */
 			case 0:
 				return -EINVAL;
 
-			/* set default/max polling rate */
-			case SENSOR_POLLRATE_MAX:
-				return ioctl(filp, SENSORIOCSPOLLRATE, 1600);
-
+			/* set default polling rate */
 			case SENSOR_POLLRATE_DEFAULT:
 				return ioctl(filp, SENSORIOCSPOLLRATE, LSM303D_ACCEL_DEFAULT_RATE);
 
@@ -864,10 +787,10 @@ LSM303D::ioctl(struct file *filp, int cmd, unsigned long arg)
 					bool want_start = (_call_accel_interval == 0);
 
 					/* convert hz to hrt interval via microseconds */
-					unsigned ticks = 1000000 / arg;
+					unsigned interval = 1000000 / arg;
 
 					/* check against maximum sane rate */
-					if (ticks < 500) {
+					if (interval < 500) {
 						return -EINVAL;
 					}
 
@@ -876,9 +799,7 @@ LSM303D::ioctl(struct file *filp, int cmd, unsigned long arg)
 
 					/* update interval for next measurement */
 					/* XXX this is a bit shady, but no other way to adjust... */
-					_call_accel_interval = ticks;
-
-					_accel_call.period = _call_accel_interval - LSM303D_TIMER_REDUCTION;
+					_call_accel_interval = interval;
 
 					/* if we need to start the poll state machine, do it */
 					if (want_start) {
@@ -890,40 +811,9 @@ LSM303D::ioctl(struct file *filp, int cmd, unsigned long arg)
 			}
 		}
 
-	case SENSORIOCGPOLLRATE:
-		if (_call_accel_interval == 0) {
-			return SENSOR_POLLRATE_MANUAL;
-		}
-
-		return 1000000 / _call_accel_interval;
-
-	case SENSORIOCSQUEUEDEPTH: {
-			/* lower bound is mandatory, upper bound is a sanity check */
-			if ((arg < 1) || (arg > 100)) {
-				return -EINVAL;
-			}
-
-			irqstate_t flags = px4_enter_critical_section();
-
-			if (!_accel_reports->resize(arg)) {
-				px4_leave_critical_section(flags);
-				return -ENOMEM;
-			}
-
-			px4_leave_critical_section(flags);
-
-			return OK;
-		}
-
 	case SENSORIOCRESET:
 		reset();
 		return OK;
-
-	case ACCELIOCSSAMPLERATE:
-		return accel_set_samplerate(arg);
-
-	case ACCELIOCGSAMPLERATE:
-		return _accel_samplerate;
 
 	case ACCELIOCSSCALE: {
 			/* copy scale, but only if off by a few percent */
@@ -939,22 +829,6 @@ LSM303D::ioctl(struct file *filp, int cmd, unsigned long arg)
 			}
 		}
 
-	case ACCELIOCSRANGE:
-		/* arg needs to be in G */
-		return accel_set_range(arg);
-
-	case ACCELIOCGRANGE:
-		/* convert to m/s^2 and return rounded in G */
-		return (unsigned long)((_accel_range_m_s2) / CONSTANTS_ONE_G + 0.5f);
-
-	case ACCELIOCGSCALE:
-		/* copy scale out */
-		memcpy((struct accel_calibration_s *) arg, &_accel_scale, sizeof(_accel_scale));
-		return OK;
-
-	case ACCELIOCSELFTEST:
-		return accel_self_test();
-
 	default:
 		/* give it to the superclass */
 		return SPI::ioctl(filp, cmd, arg);
@@ -969,21 +843,11 @@ LSM303D::mag_ioctl(struct file *filp, int cmd, unsigned long arg)
 	case SENSORIOCSPOLLRATE: {
 			switch (arg) {
 
-			/* switching to manual polling */
-			case SENSOR_POLLRATE_MANUAL:
-				stop();
-				_call_mag_interval = 0;
-				return OK;
-
-			/* external signalling not supported */
-			case SENSOR_POLLRATE_EXTERNAL:
-
 			/* zero would be bad */
 			case 0:
 				return -EINVAL;
 
-			/* set default/max polling rate */
-			case SENSOR_POLLRATE_MAX:
+			/* set default polling rate */
 			case SENSOR_POLLRATE_DEFAULT:
 				/* 100 Hz is max for mag */
 				return mag_ioctl(filp, SENSORIOCSPOLLRATE, 100);
@@ -994,16 +858,16 @@ LSM303D::mag_ioctl(struct file *filp, int cmd, unsigned long arg)
 					bool want_start = (_call_mag_interval == 0);
 
 					/* convert hz to hrt interval via microseconds */
-					unsigned ticks = 1000000 / arg;
+					unsigned interval = 1000000 / arg;
 
 					/* check against maximum sane rate */
-					if (ticks < 1000) {
+					if (interval < 1000) {
 						return -EINVAL;
 					}
 
 					/* update interval for next measurement */
 					/* XXX this is a bit shady, but no other way to adjust... */
-					_mag_call.period = _call_mag_interval = ticks;
+					_call_mag_interval = interval;
 
 					/* if we need to start the poll state machine, do it */
 					if (want_start) {
@@ -1015,40 +879,9 @@ LSM303D::mag_ioctl(struct file *filp, int cmd, unsigned long arg)
 			}
 		}
 
-	case SENSORIOCGPOLLRATE:
-		if (_call_mag_interval == 0) {
-			return SENSOR_POLLRATE_MANUAL;
-		}
-
-		return 1000000 / _call_mag_interval;
-
-	case SENSORIOCSQUEUEDEPTH: {
-			/* lower bound is mandatory, upper bound is a sanity check */
-			if ((arg < 1) || (arg > 100)) {
-				return -EINVAL;
-			}
-
-			irqstate_t flags = px4_enter_critical_section();
-
-			if (!_mag_reports->resize(arg)) {
-				px4_leave_critical_section(flags);
-				return -ENOMEM;
-			}
-
-			px4_leave_critical_section(flags);
-
-			return OK;
-		}
-
 	case SENSORIOCRESET:
 		reset();
 		return OK;
-
-	case MAGIOCSSAMPLERATE:
-		return mag_set_samplerate(arg);
-
-	case MAGIOCGSAMPLERATE:
-		return _mag_samplerate;
 
 	case MAGIOCSSCALE:
 		/* copy scale in */
@@ -1059,15 +892,6 @@ LSM303D::mag_ioctl(struct file *filp, int cmd, unsigned long arg)
 		/* copy scale out */
 		memcpy((struct mag_calibration_s *) arg, &_mag_scale, sizeof(_mag_scale));
 		return OK;
-
-	case MAGIOCSRANGE:
-		return mag_set_range(arg);
-
-	case MAGIOCGRANGE:
-		return _mag_range_ga;
-
-	case MAGIOCSELFTEST:
-		return mag_self_test();
 
 	case MAGIOCGEXTERNAL:
 		/* Even if this sensor is on the "external" SPI bus
@@ -1080,42 +904,6 @@ LSM303D::mag_ioctl(struct file *filp, int cmd, unsigned long arg)
 		/* give it to the superclass */
 		return SPI::ioctl(filp, cmd, arg);
 	}
-}
-
-int
-LSM303D::accel_self_test()
-{
-	if (_accel_read == 0) {
-		return 1;
-	}
-
-	return 0;
-}
-
-int
-LSM303D::mag_self_test()
-{
-	if (_mag_read == 0) {
-		return 1;
-	}
-
-	/**
-	 * inspect mag offsets
-	 * don't check mag scale because it seems this is calibrated on chip
-	 */
-	if (fabsf(_mag_scale.x_offset) < 0.000001f) {
-		return 1;
-	}
-
-	if (fabsf(_mag_scale.y_offset) < 0.000001f) {
-		return 1;
-	}
-
-	if (fabsf(_mag_scale.z_offset) < 0.000001f) {
-		return 1;
-	}
-
-	return 0;
 }
 
 uint8_t
@@ -1306,7 +1094,7 @@ LSM303D::accel_set_samplerate(unsigned frequency)
 	uint8_t setbits = 0;
 	uint8_t clearbits = REG1_RATE_BITS_A;
 
-	if (frequency == 0 || frequency == ACCEL_SAMPLERATE_DEFAULT) {
+	if (frequency == 0) {
 		frequency = 1600;
 	}
 
@@ -1381,18 +1169,13 @@ LSM303D::start()
 	_mag_reports->flush();
 
 	/* start polling at the specified rate */
-	hrt_call_every(&_accel_call,
-		       1000,
-		       _call_accel_interval - LSM303D_TIMER_REDUCTION,
-		       (hrt_callout)&LSM303D::measure_trampoline, this);
-	hrt_call_every(&_mag_call, 1000, _call_mag_interval, (hrt_callout)&LSM303D::mag_measure_trampoline, this);
+	ScheduleOnInterval(_call_accel_interval - LSM303D_TIMER_REDUCTION, 10000);
 }
 
 void
 LSM303D::stop()
 {
-	hrt_cancel(&_accel_call);
-	hrt_cancel(&_mag_call);
+	ScheduleClear();
 
 	/* reset internal states */
 	memset(_last_accel, 0, sizeof(_last_accel));
@@ -1403,21 +1186,14 @@ LSM303D::stop()
 }
 
 void
-LSM303D::measure_trampoline(void *arg)
+LSM303D::Run()
 {
-	LSM303D *dev = (LSM303D *)arg;
-
 	/* make another measurement */
-	dev->measure();
-}
+	measure();
 
-void
-LSM303D::mag_measure_trampoline(void *arg)
-{
-	LSM303D *dev = (LSM303D *)arg;
-
-	/* make another measurement */
-	dev->mag_measure();
+	if (hrt_elapsed_time(&_mag_last_measure) >= _call_mag_interval) {
+		mag_measure();
+	}
 }
 
 void
@@ -1465,7 +1241,7 @@ LSM303D::measure()
 	} raw_accel_report;
 #pragma pack(pop)
 
-	accel_report accel_report;
+	sensor_accel_s accel_report;
 
 	/* start the performance counter */
 	perf_begin(_accel_sample_perf);
@@ -1577,7 +1353,6 @@ LSM303D::measure()
 	accel_report.z_integral = aval_integrated(2);
 
 	accel_report.scaling = _accel_range_scale;
-	accel_report.range_m_s2 = _accel_range_m_s2;
 
 	/* return device ID */
 	accel_report.device_id = _device_id.devid;
@@ -1641,6 +1416,9 @@ LSM303D::mag_measure()
 	 */
 
 	mag_report.timestamp = hrt_absolute_time();
+
+	_mag_last_measure = mag_report.timestamp;
+
 	mag_report.is_external = external();
 
 	mag_report.x_raw = raw_mag_report.x;
@@ -1658,7 +1436,6 @@ LSM303D::mag_measure()
 	mag_report.y = ((yraw_f * _mag_range_scale) - _mag_scale.y_offset) * _mag_scale.y_scale;
 	mag_report.z = ((zraw_f * _mag_range_scale) - _mag_scale.z_offset) * _mag_scale.z_scale;
 	mag_report.scaling = _mag_range_scale;
-	mag_report.range_ga = (float)_mag_range_ga;
 	mag_report.error_count = perf_event_count(_bad_registers) + perf_event_count(_bad_values);
 
 	/* remember the temperature. The datasheet isn't clear, but it
@@ -1841,12 +1618,6 @@ LSM303D_mag::measure()
 	_parent->mag_measure();
 }
 
-void
-LSM303D_mag::measure_trampoline(void *arg)
-{
-	_parent->mag_measure_trampoline(arg);
-}
-
 /**
  * Local functions in support of the shell command.
  */
@@ -1891,7 +1662,7 @@ start(bool external_bus, enum Rotation rotation, unsigned range)
 	}
 
 	if (g_dev == nullptr) {
-		warnx("failed instantiating LSM303D obj");
+		PX4_ERR("failed instantiating LSM303D obj");
 		goto fail;
 	}
 
@@ -1907,10 +1678,6 @@ start(bool external_bus, enum Rotation rotation, unsigned range)
 	}
 
 	if (ioctl(fd, SENSORIOCSPOLLRATE, SENSOR_POLLRATE_DEFAULT) < 0) {
-		goto fail;
-	}
-
-	if (ioctl(fd, ACCELIOCSRANGE, range) < 0) {
 		goto fail;
 	}
 
@@ -1946,7 +1713,7 @@ void
 test()
 {
 	int fd_accel = -1;
-	struct accel_report accel_report;
+	sensor_accel_s accel_report;
 	ssize_t sz;
 	int ret;
 
@@ -1958,9 +1725,9 @@ test()
 	}
 
 	/* do a simple demand read */
-	sz = read(fd_accel, &accel_report, sizeof(accel_report));
+	sz = read(fd_accel, &accel_report, sizeof(sensor_accel_s));
 
-	if (sz != sizeof(accel_report)) {
+	if (sz != sizeof(sensor_accel_s)) {
 		err(1, "immediate read failed");
 	}
 
@@ -1981,7 +1748,7 @@ test()
 		errx(1, "failed to get if mag is onboard or external");
 	}
 
-	warnx("mag device active: %s", ret ? "external" : "onboard");
+	PX4_INFO("mag device active: %s", ret ? "external" : "onboard");
 
 	/* do a simple demand read */
 	sz = read(fd_mag, &m_report, sizeof(m_report));
@@ -2029,7 +1796,7 @@ reset()
 	fd = open(LSM303D_DEVICE_PATH_MAG, O_RDONLY);
 
 	if (fd < 0) {
-		warnx("mag could not be opened, external mag might be used");
+		PX4_WARN("mag could not be opened, external mag might be used");
 
 	} else {
 		/* no need to reset the mag as well, the reset() is the same */
@@ -2093,10 +1860,10 @@ test_error()
 void
 usage()
 {
-	warnx("missing command: try 'start', 'info', 'test', 'reset', 'testerror' or 'regdump'");
-	warnx("options:");
-	warnx("    -X    (external bus)");
-	warnx("    -R rotation");
+	PX4_INFO("missing command: try 'start', 'info', 'test', 'reset', 'testerror' or 'regdump'");
+	PX4_INFO("options:");
+	PX4_INFO("    -X    (external bus)");
+	PX4_INFO("    -R rotation");
 }
 
 } // namespace
@@ -2105,23 +1872,26 @@ int
 lsm303d_main(int argc, char *argv[])
 {
 	bool external_bus = false;
-	int ch;
 	enum Rotation rotation = ROTATION_NONE;
 	int accel_range = 8;
 
+	int myoptind = 1;
+	int ch;
+	const char *myoptarg = nullptr;
+
 	/* jump over start/off/etc and look at options first */
-	while ((ch = getopt(argc, argv, "XR:a:")) != EOF) {
+	while ((ch = px4_getopt(argc, argv, "XR:a:", &myoptind, &myoptarg)) != EOF) {
 		switch (ch) {
 		case 'X':
 			external_bus = true;
 			break;
 
 		case 'R':
-			rotation = (enum Rotation)atoi(optarg);
+			rotation = (enum Rotation)atoi(myoptarg);
 			break;
 
 		case 'a':
-			accel_range = atoi(optarg);
+			accel_range = atoi(myoptarg);
 			break;
 
 		default:
@@ -2130,7 +1900,12 @@ lsm303d_main(int argc, char *argv[])
 		}
 	}
 
-	const char *verb = argv[optind];
+	if (myoptind >= argc) {
+		lsm303d::usage();
+		exit(0);
+	}
+
+	const char *verb = argv[myoptind];
 
 	/*
 	 * Start/load the driver.

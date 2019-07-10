@@ -31,6 +31,8 @@
 #
 ############################################################################
 
+add_subdirectory(AttitudeControl)
+
 px4_add_module(
 	MODULE modules__mc_att_control
 	MAIN mc_att_control
@@ -40,6 +42,8 @@ px4_add_module(
 	SRCS
 		mc_att_control_main.cpp
 	DEPENDS
+		circuit_breaker
 		conversion
 		mathlib
+		AttitudeControl
 	)
